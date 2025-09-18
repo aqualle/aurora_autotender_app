@@ -84,4 +84,5 @@ def save_results_into_excel(original_path: str,
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         original.to_excel(writer, sheet_name=original_sheet_name, index=False, header=False)
         df.to_excel(writer, sheet_name=prices_sheet_name, index=False)
-    print(f"✅ Результаты сохранены в {output_path}")
+    print(f"Результаты сохранены в {output_path}")
+
