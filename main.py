@@ -4,9 +4,15 @@ from utils import debug_print_excel_rows
 if __name__ == "__main__":
     INPUT = "tender_list.xlsx"
     OUTPUT = "tender_list_result.xlsx"
-    HEADLESS = False
-    WORKERS = 1
+    HEADLESS = False   # если нужно без браузера — True
+    WORKERS = 8       # можно увеличить для ускорения (многопоточно)
     DRIVER_PATH = "chromedriver/chromedriver.exe"
 
     debug_print_excel_rows(INPUT, n=30)
-    parse_tender_excel(INPUT, OUTPUT, headless=HEADLESS, workers=WORKERS, driver_path=DRIVER_PATH)
+    parse_tender_excel(
+        INPUT,
+        OUTPUT,
+        headless=HEADLESS,
+        workers=WORKERS,
+        driver_path=DRIVER_PATH
+    )
