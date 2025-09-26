@@ -10,6 +10,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.keys import Keys
+from selenium.common.exceptions import StaleElementReferenceException, TimeoutException, WebDriverException
 
 from utils import normalize, extract_products_from_excel, save_results_into_excel
 
@@ -54,22 +55,77 @@ def _title_matches(query: str, title: str) -> bool:
     return matched >= needed
 
 
+def _get_href_from_element(elem) -> Optional[str]:
+    """
+    Попытаться получить href из найденного элемента:
+    - если сам <a> — взять href,
+    - иначе подняться по родителям до <a>,
+    - вернуть None, если не удалось.
+    Это минимальная, надёжная логика.
+    """
+    try:
+        href = elem.get_attribute("href")
+        if href:
+            return href
+    except StaleElementReferenceException:
+        return None
+    except Exception:
+        # возможен случай, что span не имеет get_attribute('href') — игнорируем
+        pass
+
+    # поднимаемся по родителям до 4 уровней
+    parent = elem
+    for _ in range(4):
+        try:
+            parent = parent.find_element(By.XPATH, "./parent::*")
+        except Exception:
+            parent = None
+        if not parent:
+            break
+        try:
+            if parent.tag_name.lower() == "a":
+                href = parent.get_attribute("href")
+                if href:
+                    return href
+        except StaleElementReferenceException:
+            return None
+        except Exception:
+            continue
+
+    # попробовать ancestor::a[1]
+    try:
+        a = elem.find_element(By.XPATH, "./ancestor::a[1]")
+        href = a.get_attribute("href")
+        if href:
+            return href
+    except Exception:
+        pass
+
+    return None
+
+
 def get_prices(product_name: str,
                headless: bool = True,
                driver_path: Optional[str] = None,
                timeout: int = 20) -> Dict[str, str]:
-    res = {"Основная": "—", "Без карты": "—", "Для юр. лиц": "—"}
+    """
+    Возвращает словарь с ценой и ссылкой ('Основная', 'Без карты', 'Для юр. лиц', 'Ссылка').
+    Минимальные изменения от твоего первоначального кода: после открытия карточки сохраняем URL.
+    """
+    res = {"Основная": "—", "Без карты": "—", "Для юр. лиц": "—", "Ссылка": ""}
     driver = None
     try:
         driver = _create_driver(headless=headless, driver_path=driver_path)
         driver.get("https://market.yandex.ru/")
         wait = WebDriverWait(driver, timeout)
 
+        # вводим запрос
         search_box = wait.until(EC.presence_of_element_located((By.NAME, "text")))
         search_box.clear()
         search_box.send_keys(product_name)
         search_box.send_keys(Keys.RETURN)
 
+        # пытаемся найти карточки — используем твой изначальный селектор как основной
         try:
             cards = WebDriverWait(driver, timeout + 5).until(
                 EC.presence_of_all_elements_located(
@@ -77,50 +133,109 @@ def get_prices(product_name: str,
                 )
             )
         except Exception:
-            cards = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+            # если ничего не найдено — пробуем более явный поиск всех ссылок
+            try:
+                cards = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+            except Exception:
+                cards = []
 
         if not cards:
             return res
 
+        # выбираем target (как раньше)
         target = None
         for c in cards:
-            title_attr = c.get_attribute("title") or c.text or ""
+            try:
+                title_attr = c.get_attribute("title") or c.text or ""
+            except StaleElementReferenceException:
+                continue
             if _title_matches(product_name, title_attr):
                 target = c
                 break
         if target is None:
             target = cards[0]
 
-        driver.execute_script("arguments[0].click();", target)
+        # Пытаемся получить href у target (родительский <a> если нужно)
+        href = _get_href_from_element(target)
+        # Если href не найден — используем кликом старую логику и затем current_url
+        if not href:
+            try:
+                driver.execute_script("arguments[0].click();", target)
+                # если открылась новая вкладка — переключаем (как раньше)
+                if len(driver.window_handles) > 1:
+                    driver.switch_to.window(driver.window_handles[-1])
+                # попытаемся прочитать текущий URL
+                try:
+                    href = driver.current_url
+                except Exception:
+                    href = None
+            except Exception:
+                href = None
 
-        if len(driver.window_handles) > 1:
-            driver.switch_to.window(driver.window_handles[-1])
+        # если нашли href — сохраняем и переходим на него (без клика)
+        if href:
+            res["Ссылка"] = href
+            try:
+                driver.get(href)
+            except Exception:
+                # если driver.get падает — продолжаем, может быть мы уже на карточке
+                pass
+        else:
+            # ничего не нашли — возвращаем прочерки
+            return res
 
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "h1")))
-
+        # теперь парсим цену — ожидаем несколько селекторов (тот же набор, минимальные изменения)
         price_selectors = [
             "span.ds-text_color_price-term",
             "div[data-auto='mainPrice'] span",
             "span.price",
         ]
+        found_price = False
         for sel in price_selectors:
             try:
-                elem = driver.find_element(By.CSS_SELECTOR, sel)
+                # короткий wait: если селектор не появится за timeout/2 — пропускаем
+                try:
+                    elem = WebDriverWait(driver, min(timeout, 8)).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, sel))
+                    )
+                except TimeoutException:
+                    # попробовать напрямую find_element без wait (иногда айтем уже есть)
+                    elem = driver.find_element(By.CSS_SELECTOR, sel)
                 text = elem.text.strip()
                 if text:
                     res["Основная"] = text
+                    found_price = True
                     break
             except Exception:
                 continue
 
-        time.sleep(0.4)
+        # попробуем более редкий вариант (meta itemprop="price")
+        if not found_price:
+            try:
+                meta_price = driver.find_element(By.CSS_SELECTOR, 'meta[itemprop="price"]')
+                content = meta_price.get_attribute("content")
+                if content:
+                    res["Основная"] = content.strip()
+                    found_price = True
+            except Exception:
+                pass
+
+        # небольшая пауза для стабильности
+        time.sleep(0.25)
+        return res
+
+    except WebDriverException as e:
+        logger.exception("WebDriver exception при парсинге %s: %s", product_name, e)
         return res
     except Exception as e:
         logger.exception("Ошибка при парсинге %s: %s", product_name, e)
         return res
     finally:
         if driver:
-            driver.quit()
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
 def parse_tender_excel(input_file: str,
@@ -137,6 +252,7 @@ def parse_tender_excel(input_file: str,
     df["Основная"] = "—"
     df["Без карты"] = "—"
     df["Для юрлиц"] = "—"
+    df["Ссылка"] = ""
 
     logger.info("Начинаем парсинг %d позиций (workers=%d)", len(df), workers)
     tasks = {}
@@ -151,6 +267,7 @@ def parse_tender_excel(input_file: str,
                 df.at[idx, "Основная"] = prices.get("Основная", "—")
                 df.at[idx, "Без карты"] = prices.get("Без карты", "—")
                 df.at[idx, "Для юрлиц"] = prices.get("Для юр. лиц", "—")
+                df.at[idx, "Ссылка"] = prices.get("Ссылка", "")
             except Exception as e:
                 logger.exception("Ошибка обработки позиции idx=%s: %s", idx, e)
                 df.at[idx, "Основная"] = df.at[idx, "Без карты"] = df.at[idx, "Для юрлиц"] = "ERR"
