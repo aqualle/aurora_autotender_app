@@ -9,58 +9,43 @@ import atexit
 import signal
 import os
 import sys
-from typing import Dict, Optional, List, Any, Tuple
+from typing import Dict, Optional, List, Any
 import pandas as pd
-from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.edge.service import Service
 from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import StaleElementReferenceException, TimeoutException, WebDriverException
-from selenium.webdriver.edge.service import Service as EdgeService
-from selenium.webdriver.chrome.service import Service as ChromeService
 from utils import extract_products_from_excel, save_results_into_tender_format
 import subprocess
 import requests
 import zipfile
 import io
 from pathlib import Path
-from undetected_chromedriver import  options
+SEARCH_URL_TEMPLATE = "https://market.yandex.ru/search?text={query}"
 
-def perform_search_js(driver, search_text):
-    script = f'''
-    var input = document.querySelector('input[name="text"]');
-    if (input) {{
-        input.value = "{search_text}";
-        var event = new Event('input', {{ bubbles: true }});
-        input.dispatchEvent(event);
-        var form = input.closest('form');
-        if (form) form.submit();
-    }}
-    '''
-    driver.execute_script(script)
 
-def extract_prices_fast(driver):
+def _normalize_search_term(search_term: str, max_len: int = 120) -> str:
+    """Нормализует строку поиска перед вводом в маркет."""
+    cleaned = re.sub(r"\s+", " ", str(search_term or "")).strip()
+    return cleaned[:max_len]
+
+
+def _perform_direct_search_navigation(driver, search_term: str) -> bool:
+    """Fallback: выполняет прямой переход на URL поиска."""
+    normalized = _normalize_search_term(search_term)
+    if not normalized:
+        return False
+
     try:
-        script = '''
-        var result = { 'цена': '', 'цена для юрлиц': '' };
-        var spans = document.querySelectorAll('span._ds-value_Line, span._2FEE_._3tFIU');
-        for (var i=0; i < spans.length; i++) {
-            var text = spans[i].innerText.toLowerCase();
-            if (text.includes('для юрлиц') || text.includes('юр.') || text.includes('организац')) {
-                result['цена для юрлиц'] = spans[i].innerText;
-            } else if (!result['цена']) {
-                result['цена'] = spans[i].innerText;
-            }
-        }
-        return result;
-        '''
-        return driver.execute_script(script)
+        encoded_query = requests.utils.quote(normalized)
+        driver.get(SEARCH_URL_TEMPLATE.format(query=encoded_query))
+        time.sleep(1.2)
+        return "search" in driver.current_url
     except Exception as e:
-        logger.error(f"Ошибка JS извлечения цен: {e}")
-        return {'цена': '', 'цена для юрлиц': ''}
+        logger.warning(f"Не удалось перейти по прямому URL поиска: {e}")
+        return False
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -543,41 +528,45 @@ def extract_products_smart(driver) -> List[Dict[str, Any]]:
 
     try:
         script = """
-        var products = [];
+        const selectors = [
+            'a[data-auto="snippet-link"]',
+            'a[data-zone-name="title"]',
+            'a[href*="/product--"]',
+            'span[role="link"][data-auto="snippet-title"]'
+        ];
 
-        // ИСПРАВЛЕННЫЙ селектор из примера пользователя
-        var cards = document.querySelectorAll('span[role="link"][data-auto="snippet-title"]');
+        const nodes = [];
+        selectors.forEach((selector) => {
+            document.querySelectorAll(selector).forEach((node) => nodes.push(node));
+        });
 
-        for (var i = 0; i < Math.min(10, cards.length); i++) {
-            var card = cards[i];
-            var title = card.textContent.trim();
+        const seen = new Set();
+        const products = [];
+
+        for (let i = 0; i < nodes.length; i++) {
+            const node = nodes[i];
+            const title = (node.textContent || '').trim();
             if (!title) continue;
 
-            // Поиск ссылки в родительских элементах (JScript)
-            var url = null;
-            var parent = card;
-            for (var j = 0; j < 5; j++) {
-                if (parent.tagName === 'A' && parent.href) {
-                    url = parent.href;
-                    break;
-                }
-                parent = parent.parentElement;
-                if (!parent) break;
+            let link = node.closest('a[href]');
+            if (!link && node.parentElement) {
+                link = node.parentElement.querySelector('a[href]');
             }
 
-            // Если не нашли в родителях, ищем в соседних элементах (JScript)
-            if (!url) {
-                var links = card.parentElement ? card.parentElement.querySelectorAll('a[href]') : [];
-                if (links.length > 0) {
-                    url = links[0].href;
-                }
-            }
+            const rawUrl = link && link.href ? link.href : '';
+            if (!rawUrl) continue;
+
+            const normalizedUrl = rawUrl.split('?')[0];
+            if (seen.has(normalizedUrl)) continue;
+            seen.add(normalizedUrl);
 
             products.push({
                 title: title,
-                url: url,
-                index: i
+                url: normalizedUrl,
+                index: products.length + 1
             });
+
+            if (products.length >= 6) break;
         }
 
         return products;
@@ -592,7 +581,8 @@ def extract_products_smart(driver) -> List[Dict[str, Any]]:
                     'url': p['url'],
                     'index': p['index']
                 }
-                for p in products_data[:5]  # Максимум 5 карточек / значение изменяемое
+                for p in products_data[:5]
+                if p.get('url') and p.get('title')
             ]
 
         if products:
@@ -736,85 +726,94 @@ def collect_prices_from_all_products(driver, products: List[Dict[str, Any]], sea
     return result
 
 def smart_search_input(driver, search_term: str, max_retries: int = 3) -> bool:
-    """УЛУЧШЕННАЯ функция поиска с определением текущего состояния страницы и обновлением запроса"""
-    current_url = driver.current_url
+    """Надёжный поиск с fallback на прямой переход к странице результатов."""
+    normalized_term = _normalize_search_term(search_term)
+    if not normalized_term:
+        logger.warning("Пустой поисковый запрос")
+        return False
 
-    # Проверяем, находимся ли мы уже на странице поиска и есть ли текст запроса
+    current_url = driver.current_url or ""
     if 'search' in current_url and 'text=' in current_url:
         logger.debug("Уже на странице поиска, обновляем запрос")
-        # Пытаемся найти поле поиска на странице результатов
-        return update_search_query(driver, search_term, max_retries)
+        success = update_search_query(driver, normalized_term, max_retries)
     else:
         logger.debug("На главной странице, выполняем новый поиск")
-        # Выполняем поиск с главной страницы
-        return perform_new_search(driver, search_term, max_retries)
+        success = perform_new_search(driver, normalized_term, max_retries)
+
+    if success:
+        return True
+
+    logger.warning("Поиск через поле не удался, пробую прямой URL")
+    return _perform_direct_search_navigation(driver, normalized_term)
 
 def update_search_query(driver, search_term: str, max_retries: int = 3) -> bool:
-    """Обновляет поисковый запрос на странице результатов"""
+    """Обновляет поисковый запрос на странице результатов."""
+
+    search_selectors = [
+        'input[name="text"]',
+        'input[data-auto="search-input"]',
+        'input[placeholder*="искать" i]',
+        'input[placeholder*="поиск" i]',
+        '.search-input input',
+        '.header-search input',
+        '[data-zone="search"] input',
+        'input.n-search__input',
+        'input[type="search"]',
+    ]
 
     for retry in range(max_retries):
         if STOP_PARSING:
             return False
 
         try:
-            # Ждем загрузки страницы
-            WebDriverWait(driver, 3).until(
+            WebDriverWait(driver, 5).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
 
-            # Расширенный список селекторов для поля поиска на странице результатов
-            search_selectors = [
-                'input[name="text"]',
-                'input[data-auto="search-input"]',
-                'input[placeholder*="искать"]',
-                'input[placeholder*="поиск"]',
-                '.search-input input',
-                '.header-search input',
-                '[data-zone="search"] input',
-                'input.n-search__input',
-                'input[type="search"]'
-            ]
-
             searchbox = None
             for selector in search_selectors:
-                try:
-                    searchbox = WebDriverWait(driver, 2).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                    )
-                    logger.debug(f"Найдено поле поиска: {selector}")
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                for candidate in elements:
+                    if candidate.is_displayed() and candidate.is_enabled():
+                        searchbox = candidate
+                        logger.debug(f"Найдено поле поиска: {selector}")
+                        break
+                if searchbox:
                     break
-                except TimeoutException:
-                    continue
 
             if not searchbox:
                 logger.warning(f"Попытка {retry + 1}: поле поиска не найдено на странице результатов")
                 if retry < max_retries - 1:
-                    # Пытаемся перейти на главную страницу
                     driver.get("https://market.yandex.ru")
                     time.sleep(1)
                     continue
                 return False
 
-            # Обновляем поисковый запрос
-            try:
-                # Очищаем текущий запрос
-                searchbox.clear()
-                time.sleep(0.3)
+            driver.execute_script(
+                """
+                const input = arguments[0];
+                const value = arguments[1];
+                input.focus();
+                input.value = '';
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.value = value;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                """,
+                searchbox,
+                search_term,
+            )
+            searchbox.send_keys(Keys.RETURN)
 
-                # Вводим новый запрос
-                searchbox.send_keys(search_term[:50])
-                time.sleep(0.3)
-                searchbox.send_keys(Keys.RETURN)
-                time.sleep(1.5)
-                return True
+            WebDriverWait(driver, 8).until(lambda d: 'search' in (d.current_url or ''))
+            return True
 
-            except StaleElementReferenceException:
-                logger.warning(f"Попытка {retry + 1}: StaleElement при обновлении запроса")
-                if retry < max_retries - 1:
-                    time.sleep(1)
-                    continue
-                return False
-
+        except (TimeoutException, StaleElementReferenceException) as e:
+            logger.warning(f"Попытка {retry + 1}: не удалось обновить запрос ({e})")
+            if retry < max_retries - 1:
+                time.sleep(1)
+                continue
+            return False
         except Exception as e:
             logger.warning(f"Попытка {retry + 1} обновления запроса: {e}")
             if retry < max_retries - 1:
@@ -825,55 +824,67 @@ def update_search_query(driver, search_term: str, max_retries: int = 3) -> bool:
     return False
 
 def perform_new_search(driver, search_term: str, max_retries: int = 3) -> bool:
-    """Выполняет новый поиск с главной страницы"""
+    """Выполняет новый поиск с главной страницы."""
+
+    selectors = [
+        (By.NAME, "text"),
+        (By.CSS_SELECTOR, "input[name='text']"),
+        (By.CSS_SELECTOR, "[data-auto='search-input']"),
+        (By.CSS_SELECTOR, "input[type='search']"),
+    ]
 
     for retry in range(max_retries):
         if STOP_PARSING:
             return False
 
         try:
-            # Ждем загрузки страницы и проверяем, что она готова (на всякий случай)
             WebDriverWait(driver, 5).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
 
-            # Находим поле поиска на главной странице
             searchbox = None
-            wait = WebDriverWait(driver, 5)
-
-            for selector_type, selector in [
-                (By.NAME, "text"),
-                (By.CSS_SELECTOR, "input[name='text']"),
-                (By.CSS_SELECTOR, "[data-auto='search-input']")
-            ]:
-                try:
-                    searchbox = wait.until(EC.element_to_be_clickable((selector_type, selector)))
+            for selector_type, selector in selectors:
+                elements = driver.find_elements(selector_type, selector)
+                for candidate in elements:
+                    if candidate.is_displayed() and candidate.is_enabled():
+                        searchbox = candidate
+                        break
+                if searchbox:
                     break
-                except TimeoutException:
-                    continue
 
             if not searchbox:
                 logger.warning(f"Попытка {retry + 1}: поле поиска не найдено на главной")
                 if retry < max_retries - 1:
+                    driver.get("https://market.yandex.ru")
                     time.sleep(1)
                     continue
                 return False
 
-            # Выполняем поиск
-            try:
-                searchbox.clear()
-                searchbox.send_keys(search_term[:50])
-                searchbox.send_keys(Keys.RETURN)
-                time.sleep(1.5)
-                return True
+            driver.execute_script(
+                """
+                const input = arguments[0];
+                const value = arguments[1];
+                input.focus();
+                input.value = '';
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.value = value;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                """,
+                searchbox,
+                search_term,
+            )
+            searchbox.send_keys(Keys.RETURN)
 
-            except StaleElementReferenceException:
-                logger.warning(f"Попытка {retry + 1}: StaleElement при новом поиске")
-                if retry < max_retries - 1:
-                    time.sleep(1)
-                    continue
-                return False
+            WebDriverWait(driver, 8).until(lambda d: 'search' in (d.current_url or ''))
+            return True
 
+        except (TimeoutException, StaleElementReferenceException) as e:
+            logger.warning(f"Попытка {retry + 1}: сбой нового поиска ({e})")
+            if retry < max_retries - 1:
+                time.sleep(1)
+                continue
+            return False
         except Exception as e:
             logger.warning(f"Попытка {retry + 1} нового поиска: {e}")
             if retry < max_retries - 1:
