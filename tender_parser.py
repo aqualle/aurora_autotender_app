@@ -23,17 +23,29 @@ import requests
 import zipfile
 import io
 from pathlib import Path
+SEARCH_URL_TEMPLATE = "https://market.yandex.ru/search?text={query}"
 
-from market_helpers import (
-    HOME_SEARCH_SELECTORS,
-    PRODUCT_LINK_SELECTORS,
-    SEARCH_INPUT_SELECTORS,
-    fill_search_input_js,
-    find_first_interactable,
-    find_first_interactable_css,
-    normalize_search_term,
-    perform_direct_search_navigation,
-)
+
+def _normalize_search_term(search_term: str, max_len: int = 120) -> str:
+    """Нормализует строку поиска перед вводом в маркет."""
+    cleaned = re.sub(r"\s+", " ", str(search_term or "")).strip()
+    return cleaned[:max_len]
+
+
+def _perform_direct_search_navigation(driver, search_term: str) -> bool:
+    """Fallback: выполняет прямой переход на URL поиска."""
+    normalized = _normalize_search_term(search_term)
+    if not normalized:
+        return False
+
+    try:
+        encoded_query = requests.utils.quote(normalized)
+        driver.get(SEARCH_URL_TEMPLATE.format(query=encoded_query))
+        time.sleep(1.2)
+        return "search" in driver.current_url
+    except Exception as e:
+        logger.warning(f"Не удалось перейти по прямому URL поиска: {e}")
+        return False
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -522,7 +534,12 @@ def extract_products_smart(driver) -> List[Dict[str, Any]]:
 
     try:
         script = """
-        const selectors = arguments[0];
+        const selectors = [
+            'a[data-auto="snippet-link"]',
+            'a[data-zone-name="title"]',
+            'a[href*="/product--"]',
+            'span[role="link"][data-auto="snippet-title"]'
+        ];
 
         const nodes = [];
         selectors.forEach((selector) => {
@@ -716,7 +733,7 @@ def collect_prices_from_all_products(driver, products: List[Dict[str, Any]], sea
 
 def smart_search_input(driver, search_term: str, max_retries: int = 3) -> bool:
     """Надёжный поиск с fallback на прямой переход к странице результатов."""
-    normalized_term = normalize_search_term(search_term)
+    normalized_term = _normalize_search_term(search_term)
     if not normalized_term:
         logger.warning("Пустой поисковый запрос")
         return False
@@ -733,12 +750,22 @@ def smart_search_input(driver, search_term: str, max_retries: int = 3) -> bool:
         return True
 
     logger.warning("Поиск через поле не удался, пробую прямой URL")
-    return perform_direct_search_navigation(driver, normalized_term, logger.warning)
+    return _perform_direct_search_navigation(driver, normalized_term)
 
 def update_search_query(driver, search_term: str, max_retries: int = 3) -> bool:
     """Обновляет поисковый запрос на странице результатов."""
 
-    search_selectors = SEARCH_INPUT_SELECTORS
+    search_selectors = [
+        'input[name="text"]',
+        'input[data-auto="search-input"]',
+        'input[placeholder*="искать" i]',
+        'input[placeholder*="поиск" i]',
+        '.search-input input',
+        '.header-search input',
+        '[data-zone="search"] input',
+        'input.n-search__input',
+        'input[type="search"]',
+    ]
 
     for retry in range(max_retries):
         if STOP_PARSING:
@@ -749,7 +776,16 @@ def update_search_query(driver, search_term: str, max_retries: int = 3) -> bool:
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
 
-            searchbox = find_first_interactable_css(driver, search_selectors)
+            searchbox = None
+            for selector in search_selectors:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                for candidate in elements:
+                    if candidate.is_displayed() and candidate.is_enabled():
+                        searchbox = candidate
+                        logger.debug(f"Найдено поле поиска: {selector}")
+                        break
+                if searchbox:
+                    break
 
             if not searchbox:
                 logger.warning(f"Попытка {retry + 1}: поле поиска не найдено на странице результатов")
@@ -759,7 +795,20 @@ def update_search_query(driver, search_term: str, max_retries: int = 3) -> bool:
                     continue
                 return False
 
-            fill_search_input_js(driver, searchbox, search_term)
+            driver.execute_script(
+                """
+                const input = arguments[0];
+                const value = arguments[1];
+                input.focus();
+                input.value = '';
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.value = value;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                """,
+                searchbox,
+                search_term,
+            )
             searchbox.send_keys(Keys.RETURN)
 
             WebDriverWait(driver, 8).until(lambda d: 'search' in (d.current_url or ''))
@@ -783,7 +832,12 @@ def update_search_query(driver, search_term: str, max_retries: int = 3) -> bool:
 def perform_new_search(driver, search_term: str, max_retries: int = 3) -> bool:
     """Выполняет новый поиск с главной страницы."""
 
-    selectors = HOME_SEARCH_SELECTORS
+    selectors = [
+        (By.NAME, "text"),
+        (By.CSS_SELECTOR, "input[name='text']"),
+        (By.CSS_SELECTOR, "[data-auto='search-input']"),
+        (By.CSS_SELECTOR, "input[type='search']"),
+    ]
 
     for retry in range(max_retries):
         if STOP_PARSING:
@@ -794,7 +848,15 @@ def perform_new_search(driver, search_term: str, max_retries: int = 3) -> bool:
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
 
-            searchbox = find_first_interactable(driver, selectors)
+            searchbox = None
+            for selector_type, selector in selectors:
+                elements = driver.find_elements(selector_type, selector)
+                for candidate in elements:
+                    if candidate.is_displayed() and candidate.is_enabled():
+                        searchbox = candidate
+                        break
+                if searchbox:
+                    break
 
             if not searchbox:
                 logger.warning(f"Попытка {retry + 1}: поле поиска не найдено на главной")
@@ -804,7 +866,20 @@ def perform_new_search(driver, search_term: str, max_retries: int = 3) -> bool:
                     continue
                 return False
 
-            fill_search_input_js(driver, searchbox, search_term)
+            driver.execute_script(
+                """
+                const input = arguments[0];
+                const value = arguments[1];
+                input.focus();
+                input.value = '';
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.value = value;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                """,
+                searchbox,
+                search_term,
+            )
             searchbox.send_keys(Keys.RETURN)
 
             WebDriverWait(driver, 8).until(lambda d: 'search' in (d.current_url or ''))
