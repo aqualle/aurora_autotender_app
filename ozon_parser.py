@@ -4,6 +4,7 @@ import time
 import logging
 import re
 import os
+import requests
 from typing import Dict, Optional
 from selenium import webdriver
 from selenium.webdriver.edge.service import Service as EdgeService
@@ -19,6 +20,25 @@ logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(m
 logger = logging.getLogger(__name__)
 
 STOP_PARSING = False
+
+
+def _normalize_ozon_query(product_name: str, max_len: int = 120) -> str:
+    return re.sub(r"\s+", " ", str(product_name or "")).strip()[:max_len]
+
+
+def _go_to_ozon_search(driver, query: str) -> bool:
+    if not query:
+        return False
+    try:
+        encoded_query = requests.utils.quote(query)
+        driver.get(f"https://www.ozon.ru/search/?text={encoded_query}")
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, 'a[href*="/product/"]'))
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Не удалось перейти на страницу поиска Ozon напрямую: {e}")
+        return False
 
 def create_ozon_edge_driver(headless: bool = False):
     paths = get_browser_paths()["edge"]
@@ -184,13 +204,14 @@ def get_prices(product_name: str, headless: bool = True, driver_path: Optional[s
         #     logger.error("Установите: pip install undetected-chromedriver")
         #     return result
         
-        logger.info(f"🔍 Поиск на Ozon: {product_name[:40]}...")
+        query = _normalize_ozon_query(product_name)
+        logger.info(f"🔍 Поиск на Ozon: {query[:40]}...")
         
         # Создаём UNDETECTED браузер
         driver = None
         try:
             # driver = uc.Chrome(headless=headless, version_main=None)
-            driver = create_ozon_edge_driver(headless=False)
+            driver = create_ozon_edge_driver(headless=headless)
             logger.debug("✅ Undetected браузер создан")
         except Exception as e:
             logger.error(f"Ошибка создания браузера: {e}")
@@ -230,20 +251,23 @@ def get_prices(product_name: str, headless: bool = True, driver_path: Optional[s
                 logger.debug("✅ Поле поиска найдено")
             except Exception as e:
                 logger.error(f"❌ Поле поиска не найдено: {e}")
-                return result
+                if not _go_to_ozon_search(driver, query):
+                    return result
+                search_input = None
             
-            # Клик и ввод поиска
-            logger.debug("Начинаю ввод поиска...")
-            search_input.click()
-            time.sleep(0.5)
-            search_input.clear()
-            time.sleep(0.3)
-            search_input.send_keys(product_name[:50])
-            logger.debug(f"✅ Введён текст: {product_name[:50]}")
-            time.sleep(0.5)
-            search_input.send_keys(Keys.RETURN)
-            logger.debug("✅ Нажал Enter")
-            time.sleep(4)
+            # Клик и ввод поиска (если нашли поле на главной)
+            if search_input is not None:
+                logger.debug("Начинаю ввод поиска...")
+                search_input.click()
+                time.sleep(0.5)
+                search_input.clear()
+                time.sleep(0.3)
+                search_input.send_keys(query[:50])
+                logger.debug(f"✅ Введён текст: {query[:50]}")
+                time.sleep(0.5)
+                search_input.send_keys(Keys.RETURN)
+                logger.debug("✅ Нажал Enter")
+                time.sleep(4)
             
             if STOP_PARSING:
                 return result
