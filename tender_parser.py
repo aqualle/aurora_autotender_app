@@ -295,6 +295,7 @@ def create_driver(
 
         profile_dir = app_dir / f"{browser}_profile_{worker_id}_{timestamp}"
         profile_dir.mkdir(parents=True, exist_ok=True)
+        options.add_argument(f"--user-data-dir={profile_dir}")
         CREATED_PROFILES.add(str(profile_dir))
     else:
         temp_dir = tempfile.mkdtemp(prefix=f"{browser}_temp_{uuid.uuid4().hex[:8]}_")
@@ -310,19 +311,24 @@ def create_driver(
         base_dir = Path(__file__).parent / "browserdriver"
         base_dir.mkdir(exist_ok=True)
 
+        custom_driver = Path(driver_path).expanduser() if driver_path else None
+        if custom_driver and not custom_driver.exists():
+            raise FileNotFoundError(f"Не найден указанный драйвер: {custom_driver}")
+
         if browser == "edge":
-            driver_exe = ensure_edgedriver(base_dir)
+            driver_exe = custom_driver if custom_driver else ensure_edgedriver(base_dir)
             service = Service(str(driver_exe))
             driver = webdriver.Edge(service=service, options=options)
 
         else:  # chrome
             from selenium.webdriver.chrome.service import Service as ChromeService
-            driver_exe = ensure_chromedriver(base_dir)
+            driver_exe = custom_driver if custom_driver else ensure_chromedriver(base_dir)
             service = ChromeService(str(driver_exe))
             driver = webdriver.Chrome(service=service, options=options)
 
         driver.set_page_load_timeout(15)
         driver.implicitly_wait(3)
+        driver.profile_path = str(profile_dir) if profile_dir else temp_dir
 
         return driver
 
@@ -572,7 +578,7 @@ def extract_products_smart(driver) -> List[Dict[str, Any]]:
         return products;
         """
 
-        products_data = driver.execute_script(script)
+        products_data = driver.execute_script(script, PRODUCT_LINK_SELECTORS)
 
         if products_data:
             products = [
@@ -910,17 +916,8 @@ def get_prices(product_name: str, headless: bool = True, driver_path: Optional[s
         driver.get("https://market.yandex.ru/")
         time.sleep(0.5)
 
-        # Отслеживаем профиль для очистки cookies
-        if use_business_auth:
-            for profile_path in CREATED_PROFILES:
-                if 'edge_profile_' in profile_path:
-                    current_profile_path = profile_path
-                    break
-        else:
-            for profile_path in CREATED_PROFILES:
-                if 'edge_temp_' in profile_path:
-                    current_profile_path = profile_path
-                    break
+        # Отслеживаем профиль текущего драйвера для точечной очистки
+        current_profile_path = getattr(driver, "profile_path", None)
 
         # Загрузка cookies для авторизации и поиска
         if use_business_auth and not STOP_PARSING:
@@ -982,6 +979,10 @@ def get_prices(product_name: str, headless: bool = True, driver_path: Optional[s
             if success:
                 CREATED_PROFILES.discard(current_profile_path)
 
+def _make_product_cache_key(product_name: str) -> str:
+    """Ключ кэша для повторяющихся наименований товаров."""
+    return re.sub(r"\s+", " ", str(product_name or "")).strip().lower()
+
 def parse_tender_excel(input_file: str, output_file: str, headless: bool = True,
                       workers: int = 1, driver_path: Optional[str] = None,
                       auto_save: bool = True, use_business_auth: bool = False) -> pd.DataFrame:
@@ -1010,26 +1011,41 @@ def parse_tender_excel(input_file: str, output_file: str, headless: bool = True,
 
     CURRENT_DATAFRAME = df  # Для автосохранения
 
+    effective_workers = max(1, int(workers or 1))
+    if effective_workers != 1:
+        logger.warning("Параметр workers сейчас не используется: обработка выполняется последовательно")
+
     auth_text = "с авторизацией" if use_business_auth else "без авторизации"
     logger.info(f"Начинаю обработку {len(df)} товаров {auth_text}")
     logger.info("🔄 Автосохранение при принудительном завершении АКТИВНО")
     logger.info("📋 РЕЗУЛЬТАТ: тендерная таблица с колонкой 'Яндекс Маркет'")
     logger.info("Режим: поиск наименьшей цены среди 5 карточек")
 
+    cache: Dict[str, Dict[str, str]] = {}
+
     try:
-        for idx, row in df.iterrows():
+        for idx, row in enumerate(df.itertuples(index=False), start=1):
             if STOP_PARSING:
                 logger.info("Парсинг остановлен")
                 break
 
             try:
-                logger.info(f"Обработка: {idx + 1}/{len(df)} - {row['наименование'][:40]}...")
+                product_name = row.наименование
+                logger.info(f"Обработка: {idx}/{len(df)} - {product_name[:40]}...")
 
-                prices = get_prices(row['наименование'], headless, driver_path, 20, use_business_auth)
+                cache_key = _make_product_cache_key(product_name)
+                if cache_key in cache:
+                    prices = cache[cache_key]
+                    logger.info(f"Повтор товара, использую кэш: {product_name[:40]}...")
+                else:
+                    prices = get_prices(product_name, headless, driver_path, 20, use_business_auth)
+                    if any(prices.get(k) for k in ("цена", "цена для юрлиц", "ссылка")):
+                        cache[cache_key] = prices.copy()
 
-                df.at[idx, 'цена'] = prices.get('цена', '')
-                df.at[idx, 'цена для юрлиц'] = prices.get('цена для юрлиц', '')
-                df.at[idx, 'ссылка'] = prices.get('ссылка', '')
+                row_idx = idx - 1
+                df.at[row_idx, 'цена'] = prices.get('цена', '')
+                df.at[row_idx, 'цена для юрлиц'] = prices.get('цена для юрлиц', '')
+                df.at[row_idx, 'ссылка'] = prices.get('ссылка', '')
 
                 # Лог результата
                 price_summary = []
@@ -1039,22 +1055,22 @@ def parse_tender_excel(input_file: str, output_file: str, headless: bool = True,
                     price_summary.append(f"Для юрлиц: {prices['цена для юрлиц'][:15]}")
 
                 if price_summary:
-                    logger.info(f"Результат {idx + 1}/{len(df)}: {', '.join(price_summary)}")
+                    logger.info(f"Результат {idx}/{len(df)}: {', '.join(price_summary)}")
                 else:
-                    logger.info(f"Результат {idx + 1}/{len(df)}: цены не найдены")
+                    logger.info(f"Результат {idx}/{len(df)}: цены не найдены")
 
                 # Автосохранение каждые 3 товара В ТЕНДЕРНОМ ФОРМАТЕ
-                if auto_save and (idx + 1) % 3 == 0:
+                if auto_save and idx % 3 == 0:
                     try:
                         save_results_into_tender_format(input_file, output_file, df)
-                        logger.info(f"Автосохранение тендера: {idx + 1}/{len(df)}")
+                        logger.info(f"Автосохранение тендера: {idx}/{len(df)}")
                     except Exception as e:
                         logger.warning(f"Ошибка автосохранения: {e}")
 
             except Exception as e:
-                logger.error(f"Ошибка товара {idx + 1}: {e}")
-                df.at[idx, 'цена'] = "ОШИБКА"
-                df.at[idx, 'цена для юрлиц'] = "ОШИБКА"
+                logger.error(f"Ошибка товара {idx}: {e}")
+                df.at[idx - 1, 'цена'] = "ОШИБКА"
+                df.at[idx - 1, 'цена для юрлиц'] = "ОШИБКА"
 
     finally:
         cleanup_profiles()
