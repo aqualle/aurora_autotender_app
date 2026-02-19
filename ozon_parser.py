@@ -40,22 +40,6 @@ def _go_to_ozon_search(driver, query: str) -> bool:
         logger.warning(f"Не удалось перейти на страницу поиска Ozon напрямую: {e}")
         return False
 
-
-
-def _score_ozon_relevance(search_term: str, title: str) -> int:
-    query_tokens = {
-        t for t in re.split(r"[^a-zA-Zа-яА-Я0-9]+", str(search_term).lower())
-        if len(t) >= 3
-    }
-    title_tokens = {
-        t for t in re.split(r"[^a-zA-Zа-яА-Я0-9]+", str(title).lower())
-        if len(t) >= 3
-    }
-    if not query_tokens or not title_tokens:
-        return 0
-    return len(query_tokens & title_tokens)
-
-
 def create_ozon_edge_driver(headless: bool = False):
     paths = get_browser_paths()["edge"]
 
@@ -332,22 +316,36 @@ def get_prices(product_name: str, headless: bool = True, driver_path: Optional[s
             if not candidates_data:
                 logger.warning("❌ Товары не найдены")
                 return result
-
-            logger.info(f"✅ Найдено товаров: {len(candidates_data)}")
-
+            
+            logger.info(f"✅ Найдено товаров: {len(product_links)}")
+            
             # Собираем и ранжируем кандидатов по релевантности
             candidates = []
-            for item in candidates_data:
-                url = (item or {}).get('url', '')
-                if not url:
+            seen = set()
+            for link in product_links[:40]:
+                try:
+                    url = link.get_attribute('href')
+                    if not url or '/product/' not in url:
+                        continue
+                    normalized_url = url.split('?')[0]
+                    if normalized_url in seen:
+                        continue
+
+                    title = (link.text or '').strip()
+                    if not title:
+                        title = (link.get_attribute('title') or '').strip()
+                    if not title:
+                        title = (link.get_attribute('aria-label') or '').strip()
+
+                    score = _score_ozon_relevance(query, title)
+                    candidates.append({
+                        'url': normalized_url,
+                        'title': title,
+                        'score': score,
+                    })
+                    seen.add(normalized_url)
+                except Exception:
                     continue
-                title = ((item or {}).get('title') or '').strip()
-                score = _score_ozon_relevance(query, title)
-                candidates.append({
-                    'url': url,
-                    'title': title,
-                    'score': score,
-                })
 
             if not candidates:
                 logger.warning("❌ Не удалось сформировать список кандидатов")
