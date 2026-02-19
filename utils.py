@@ -220,7 +220,7 @@ def save_results_into_tender_format(original_path: str, output_path: str,
     if is_yandex:
         print("🔗 Режим: ГИПЕРССЫЛКА для Яндекс.Маркет")
     elif is_ozon:
-        print("📝 Режим: ТЕКСТ для Ozon")
+        print("🔗 Режим: ГИПЕРССЫЛКА для Ozon")
 
     try:
         if not os.path.exists(output_path):
