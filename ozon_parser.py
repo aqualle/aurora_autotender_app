@@ -283,9 +283,37 @@ def get_prices(product_name: str, headless: bool = True, driver_path: Optional[s
                 logger.warning(f"❌ Результаты не загрузились: {e}")
                 return result
             
-            # Находим товары
-            product_links = driver.find_elements(By.CSS_SELECTOR, 'a[href*="/product/"]')
-            if not product_links:
+            # Находим товары (через JS, чтобы меньше ловить stale-элементы)
+            candidates_data = driver.execute_script("""
+                const selectors = [
+                    'a[href*="/product/"]',
+                    'a.tile-hover-target',
+                    '[data-widget="searchResultsV2"] a[href*="/product/"]'
+                ];
+                const nodes = [];
+                selectors.forEach((s) => document.querySelectorAll(s).forEach((n) => nodes.push(n)));
+
+                const seen = new Set();
+                const out = [];
+                for (let i = 0; i < nodes.length; i++) {
+                    const a = nodes[i].closest('a[href]') || nodes[i];
+                    const href = a && a.href ? a.href : '';
+                    if (!href || !href.includes('/product/')) continue;
+                    const normalized = href.split('?')[0];
+                    if (seen.has(normalized)) continue;
+                    seen.add(normalized);
+
+                    let title = (a.textContent || '').trim();
+                    if (!title) title = (a.getAttribute('title') || '').trim();
+                    if (!title) title = (a.getAttribute('aria-label') || '').trim();
+
+                    out.push({ url: normalized, title: title });
+                    if (out.length >= 60) break;
+                }
+                return out;
+            """)
+
+            if not candidates_data:
                 logger.warning("❌ Товары не найдены")
                 return result
             
