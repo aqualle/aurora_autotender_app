@@ -220,7 +220,7 @@ def save_results_into_tender_format(original_path: str, output_path: str,
     if is_yandex:
         print("🔗 Режим: ГИПЕРССЫЛКА для Яндекс.Маркет")
     elif is_ozon:
-        print("📝 Режим: ТЕКСТ для Ozon")
+        print("🔗 Режим: ГИПЕРССЫЛКА для Ozon")
 
     try:
         if not os.path.exists(output_path):
@@ -365,9 +365,10 @@ def save_results_into_tender_format(original_path: str, output_path: str,
                         link_cell.font = Font(color="0563C1", underline="single", size=9)
                         link_cell.alignment = Alignment(horizontal='center', vertical='center')
                     elif is_ozon:
-                        link_cell.value = link
+                        link_cell.value = "Ссылка"
+                        link_cell.hyperlink = link
                         link_cell.font = Font(color="0563C1", underline="single", size=9)
-                        link_cell.alignment = Alignment(horizontal='left', wrap_text=True)
+                        link_cell.alignment = Alignment(horizontal='center', vertical='center')
 
                     link_count += 1
 

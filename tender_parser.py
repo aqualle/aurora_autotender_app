@@ -9,58 +9,31 @@ import atexit
 import signal
 import os
 import sys
-from typing import Dict, Optional, List, Any, Tuple
+from typing import Dict, Optional, List, Any
 import pandas as pd
-from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.edge.service import Service
 from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import StaleElementReferenceException, TimeoutException, WebDriverException
-from selenium.webdriver.edge.service import Service as EdgeService
-from selenium.webdriver.chrome.service import Service as ChromeService
 from utils import extract_products_from_excel, save_results_into_tender_format
 import subprocess
 import requests
 import zipfile
 import io
 from pathlib import Path
-from undetected_chromedriver import  options
 
-def perform_search_js(driver, search_text):
-    script = f'''
-    var input = document.querySelector('input[name="text"]');
-    if (input) {{
-        input.value = "{search_text}";
-        var event = new Event('input', {{ bubbles: true }});
-        input.dispatchEvent(event);
-        var form = input.closest('form');
-        if (form) form.submit();
-    }}
-    '''
-    driver.execute_script(script)
-
-def extract_prices_fast(driver):
-    try:
-        script = '''
-        var result = { 'цена': '', 'цена для юрлиц': '' };
-        var spans = document.querySelectorAll('span._ds-value_Line, span._2FEE_._3tFIU');
-        for (var i=0; i < spans.length; i++) {
-            var text = spans[i].innerText.toLowerCase();
-            if (text.includes('для юрлиц') || text.includes('юр.') || text.includes('организац')) {
-                result['цена для юрлиц'] = spans[i].innerText;
-            } else if (!result['цена']) {
-                result['цена'] = spans[i].innerText;
-            }
-        }
-        return result;
-        '''
-        return driver.execute_script(script)
-    except Exception as e:
-        logger.error(f"Ошибка JS извлечения цен: {e}")
-        return {'цена': '', 'цена для юрлиц': ''}
+from market_helpers import (
+    HOME_SEARCH_SELECTORS,
+    PRODUCT_LINK_SELECTORS,
+    SEARCH_INPUT_SELECTORS,
+    fill_search_input_js,
+    find_first_interactable,
+    find_first_interactable_css,
+    normalize_search_term,
+    perform_direct_search_navigation,
+)
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -310,6 +283,7 @@ def create_driver(
 
         profile_dir = app_dir / f"{browser}_profile_{worker_id}_{timestamp}"
         profile_dir.mkdir(parents=True, exist_ok=True)
+        options.add_argument(f"--user-data-dir={profile_dir}")
         CREATED_PROFILES.add(str(profile_dir))
     else:
         temp_dir = tempfile.mkdtemp(prefix=f"{browser}_temp_{uuid.uuid4().hex[:8]}_")
@@ -325,19 +299,30 @@ def create_driver(
         base_dir = Path(__file__).parent / "browserdriver"
         base_dir.mkdir(exist_ok=True)
 
+        custom_driver = None
+        if driver_path:
+            if isinstance(driver_path, (str, os.PathLike)):
+                custom_driver = Path(driver_path).expanduser()
+            else:
+                logger.warning(f"Некорректный тип driver_path={type(driver_path).__name__}, использую автоподбор драйвера")
+
+        if custom_driver and not custom_driver.exists():
+            raise FileNotFoundError(f"Не найден указанный драйвер: {custom_driver}")
+
         if browser == "edge":
-            driver_exe = ensure_edgedriver(base_dir)
+            driver_exe = custom_driver if custom_driver else ensure_edgedriver(base_dir)
             service = Service(str(driver_exe))
             driver = webdriver.Edge(service=service, options=options)
 
         else:  # chrome
             from selenium.webdriver.chrome.service import Service as ChromeService
-            driver_exe = ensure_chromedriver(base_dir)
+            driver_exe = custom_driver if custom_driver else ensure_chromedriver(base_dir)
             service = ChromeService(str(driver_exe))
             driver = webdriver.Chrome(service=service, options=options)
 
         driver.set_page_load_timeout(15)
         driver.implicitly_wait(3)
+        driver.profile_path = str(profile_dir) if profile_dir else temp_dir
 
         return driver
 
@@ -543,47 +528,52 @@ def extract_products_smart(driver) -> List[Dict[str, Any]]:
 
     try:
         script = """
-        var products = [];
+        const selectors = arguments[0];
 
-        // ИСПРАВЛЕННЫЙ селектор из примера пользователя
-        var cards = document.querySelectorAll('span[role="link"][data-auto="snippet-title"]');
+        const nodes = [];
+        selectors.forEach((selector) => {
+            document.querySelectorAll(selector).forEach((node) => nodes.push(node));
+        });
 
-        for (var i = 0; i < Math.min(10, cards.length); i++) {
-            var card = cards[i];
-            var title = card.textContent.trim();
+        const seen = new Set();
+        const products = [];
+
+        for (let i = 0; i < nodes.length; i++) {
+            const node = nodes[i];
+            const title = (node.textContent || '').trim();
             if (!title) continue;
 
-            // Поиск ссылки в родительских элементах (JScript)
-            var url = null;
-            var parent = card;
-            for (var j = 0; j < 5; j++) {
-                if (parent.tagName === 'A' && parent.href) {
-                    url = parent.href;
-                    break;
-                }
-                parent = parent.parentElement;
-                if (!parent) break;
+            let link = node.closest('a[href]');
+            if (!link && node.parentElement) {
+                link = node.parentElement.querySelector('a[href]');
             }
 
-            // Если не нашли в родителях, ищем в соседних элементах (JScript)
-            if (!url) {
-                var links = card.parentElement ? card.parentElement.querySelectorAll('a[href]') : [];
-                if (links.length > 0) {
-                    url = links[0].href;
-                }
-            }
+            const rawUrl = link && link.href ? link.href : '';
+            if (!rawUrl) continue;
+
+            const normalizedUrl = rawUrl.split('?')[0];
+            if (seen.has(normalizedUrl)) continue;
+            seen.add(normalizedUrl);
 
             products.push({
                 title: title,
-                url: url,
-                index: i
+                url: normalizedUrl,
+                index: products.length + 1
             });
+
+            if (products.length >= 6) break;
         }
 
         return products;
         """
 
-        products_data = driver.execute_script(script)
+        selectors = globals().get("PRODUCT_LINK_SELECTORS") or [
+            "a[data-auto=\"snippet-link\"]",
+            "a[data-zone-name=\"title\"]",
+            "a[href*=\"/product--\"]",
+            "span[role=\"link\"][data-auto=\"snippet-title\"]",
+        ]
+        products_data = driver.execute_script(script, selectors)
 
         if products_data:
             products = [
@@ -592,7 +582,8 @@ def extract_products_smart(driver) -> List[Dict[str, Any]]:
                     'url': p['url'],
                     'index': p['index']
                 }
-                for p in products_data[:5]  # Максимум 5 карточек / значение изменяемое
+                for p in products_data[:5]
+                if p.get('url') and p.get('title')
             ]
 
         if products:
@@ -603,6 +594,22 @@ def extract_products_smart(driver) -> List[Dict[str, Any]]:
         logger.warning(f"Ошибка извлечения товаров: {e}")
 
     return products
+
+
+
+def _score_product_relevance(search_term: str, title: str) -> int:
+    """Простая оценка релевантности карточки по пересечению токенов."""
+    query_tokens = {
+        t for t in re.split(r"[^a-zA-Zа-яА-Я0-9]+", str(search_term).lower())
+        if len(t) >= 3
+    }
+    title_tokens = {
+        t for t in re.split(r"[^a-zA-Zа-яА-Я0-9]+", str(title).lower())
+        if len(t) >= 3
+    }
+    if not query_tokens or not title_tokens:
+        return 0
+    return len(query_tokens & title_tokens)
 
 def parse_price_to_number(price_str: str) -> float:
     """Конвертирует строку цены в число для сравнения"""
@@ -632,13 +639,28 @@ def collect_prices_from_all_products(driver, products: List[Dict[str, Any]], sea
         logger.warning("Нет товаров для обработки")
         return result
 
+    scored_products = []
+    for product in products:
+        score = _score_product_relevance(search_term, product.get('title', ''))
+        product_copy = dict(product)
+        product_copy['relevance_score'] = score
+        scored_products.append(product_copy)
+
+    max_score = max((p['relevance_score'] for p in scored_products), default=0)
+    if max_score > 0:
+        filtered_products = [p for p in scored_products if p['relevance_score'] == max_score]
+        logger.info(f"Отобрано релевантных карточек: {len(filtered_products)} из {len(products)} (score={max_score})")
+    else:
+        filtered_products = scored_products
+        logger.info("Релевантные токены не найдены, проверяю исходные карточки")
+
     # Контейнеры для всех найденных цен
     all_products_data = []
 
-    logger.info(f"Собираю цены с {len(products)} карточек товаров:")
+    logger.info(f"Собираю цены с {len(filtered_products)} карточек товаров:")
 
-    # Проходим по ВСЕМ товарам и собираем цены
-    for i, product in enumerate(products, 1):
+    # Проходим по отфильтрованным товарам и собираем цены
+    for i, product in enumerate(filtered_products, 1):
         if STOP_PARSING:
             break
 
@@ -736,85 +758,62 @@ def collect_prices_from_all_products(driver, products: List[Dict[str, Any]], sea
     return result
 
 def smart_search_input(driver, search_term: str, max_retries: int = 3) -> bool:
-    """УЛУЧШЕННАЯ функция поиска с определением текущего состояния страницы и обновлением запроса"""
-    current_url = driver.current_url
+    """Надёжный поиск с fallback на прямой переход к странице результатов."""
+    normalized_term = normalize_search_term(search_term)
+    if not normalized_term:
+        logger.warning("Пустой поисковый запрос")
+        return False
 
-    # Проверяем, находимся ли мы уже на странице поиска и есть ли текст запроса
+    current_url = driver.current_url or ""
     if 'search' in current_url and 'text=' in current_url:
         logger.debug("Уже на странице поиска, обновляем запрос")
-        # Пытаемся найти поле поиска на странице результатов
-        return update_search_query(driver, search_term, max_retries)
+        success = update_search_query(driver, normalized_term, max_retries)
     else:
         logger.debug("На главной странице, выполняем новый поиск")
-        # Выполняем поиск с главной страницы
-        return perform_new_search(driver, search_term, max_retries)
+        success = perform_new_search(driver, normalized_term, max_retries)
+
+    if success:
+        return True
+
+    logger.warning("Поиск через поле не удался, пробую прямой URL")
+    return perform_direct_search_navigation(driver, normalized_term, logger.warning)
 
 def update_search_query(driver, search_term: str, max_retries: int = 3) -> bool:
-    """Обновляет поисковый запрос на странице результатов"""
+    """Обновляет поисковый запрос на странице результатов."""
+
+    search_selectors = SEARCH_INPUT_SELECTORS
 
     for retry in range(max_retries):
         if STOP_PARSING:
             return False
 
         try:
-            # Ждем загрузки страницы
-            WebDriverWait(driver, 3).until(
+            WebDriverWait(driver, 5).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
 
-            # Расширенный список селекторов для поля поиска на странице результатов
-            search_selectors = [
-                'input[name="text"]',
-                'input[data-auto="search-input"]',
-                'input[placeholder*="искать"]',
-                'input[placeholder*="поиск"]',
-                '.search-input input',
-                '.header-search input',
-                '[data-zone="search"] input',
-                'input.n-search__input',
-                'input[type="search"]'
-            ]
-
-            searchbox = None
-            for selector in search_selectors:
-                try:
-                    searchbox = WebDriverWait(driver, 2).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                    )
-                    logger.debug(f"Найдено поле поиска: {selector}")
-                    break
-                except TimeoutException:
-                    continue
+            searchbox = find_first_interactable_css(driver, search_selectors)
 
             if not searchbox:
                 logger.warning(f"Попытка {retry + 1}: поле поиска не найдено на странице результатов")
                 if retry < max_retries - 1:
-                    # Пытаемся перейти на главную страницу
                     driver.get("https://market.yandex.ru")
                     time.sleep(1)
                     continue
                 return False
 
-            # Обновляем поисковый запрос
-            try:
-                # Очищаем текущий запрос
-                searchbox.clear()
-                time.sleep(0.3)
+            fill_search_input_js(driver, searchbox, search_term)
+            searchbox.send_keys(Keys.RETURN)
 
-                # Вводим новый запрос
-                searchbox.send_keys(search_term[:50])
-                time.sleep(0.3)
-                searchbox.send_keys(Keys.RETURN)
-                time.sleep(1.5)
-                return True
+            WebDriverWait(driver, 8).until(lambda d: 'search' in (d.current_url or ''))
+            return True
 
-            except StaleElementReferenceException:
-                logger.warning(f"Попытка {retry + 1}: StaleElement при обновлении запроса")
-                if retry < max_retries - 1:
-                    time.sleep(1)
-                    continue
-                return False
-
+        except (TimeoutException, StaleElementReferenceException) as e:
+            logger.warning(f"Попытка {retry + 1}: не удалось обновить запрос ({e})")
+            if retry < max_retries - 1:
+                time.sleep(1)
+                continue
+            return False
         except Exception as e:
             logger.warning(f"Попытка {retry + 1} обновления запроса: {e}")
             if retry < max_retries - 1:
@@ -825,55 +824,41 @@ def update_search_query(driver, search_term: str, max_retries: int = 3) -> bool:
     return False
 
 def perform_new_search(driver, search_term: str, max_retries: int = 3) -> bool:
-    """Выполняет новый поиск с главной страницы"""
+    """Выполняет новый поиск с главной страницы."""
+
+    selectors = HOME_SEARCH_SELECTORS
 
     for retry in range(max_retries):
         if STOP_PARSING:
             return False
 
         try:
-            # Ждем загрузки страницы и проверяем, что она готова (на всякий случай)
             WebDriverWait(driver, 5).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
 
-            # Находим поле поиска на главной странице
-            searchbox = None
-            wait = WebDriverWait(driver, 5)
-
-            for selector_type, selector in [
-                (By.NAME, "text"),
-                (By.CSS_SELECTOR, "input[name='text']"),
-                (By.CSS_SELECTOR, "[data-auto='search-input']")
-            ]:
-                try:
-                    searchbox = wait.until(EC.element_to_be_clickable((selector_type, selector)))
-                    break
-                except TimeoutException:
-                    continue
+            searchbox = find_first_interactable(driver, selectors)
 
             if not searchbox:
                 logger.warning(f"Попытка {retry + 1}: поле поиска не найдено на главной")
                 if retry < max_retries - 1:
+                    driver.get("https://market.yandex.ru")
                     time.sleep(1)
                     continue
                 return False
 
-            # Выполняем поиск
-            try:
-                searchbox.clear()
-                searchbox.send_keys(search_term[:50])
-                searchbox.send_keys(Keys.RETURN)
-                time.sleep(1.5)
-                return True
+            fill_search_input_js(driver, searchbox, search_term)
+            searchbox.send_keys(Keys.RETURN)
 
-            except StaleElementReferenceException:
-                logger.warning(f"Попытка {retry + 1}: StaleElement при новом поиске")
-                if retry < max_retries - 1:
-                    time.sleep(1)
-                    continue
-                return False
+            WebDriverWait(driver, 8).until(lambda d: 'search' in (d.current_url or ''))
+            return True
 
+        except (TimeoutException, StaleElementReferenceException) as e:
+            logger.warning(f"Попытка {retry + 1}: сбой нового поиска ({e})")
+            if retry < max_retries - 1:
+                time.sleep(1)
+                continue
+            return False
         except Exception as e:
             logger.warning(f"Попытка {retry + 1} нового поиска: {e}")
             if retry < max_retries - 1:
@@ -890,6 +875,13 @@ def get_prices(product_name: str, headless: bool = True, driver_path: Optional[s
     driver = None
     current_profile_path = None
 
+    # Совместимость со старым позиционным вызовом: get_prices(name, headless, timeout, use_business_auth)
+    if isinstance(driver_path, (int, float)):
+        if timeout == 15:
+            timeout = int(driver_path)
+        logger.warning("Обнаружен старый позиционный вызов get_prices(..., timeout, ...). Обновите вызов на именованные аргументы")
+        driver_path = None
+
     if STOP_PARSING:
         return result
 
@@ -899,17 +891,8 @@ def get_prices(product_name: str, headless: bool = True, driver_path: Optional[s
         driver.get("https://market.yandex.ru/")
         time.sleep(0.5)
 
-        # Отслеживаем профиль для очистки cookies
-        if use_business_auth:
-            for profile_path in CREATED_PROFILES:
-                if 'edge_profile_' in profile_path:
-                    current_profile_path = profile_path
-                    break
-        else:
-            for profile_path in CREATED_PROFILES:
-                if 'edge_temp_' in profile_path:
-                    current_profile_path = profile_path
-                    break
+        # Отслеживаем профиль текущего драйвера для точечной очистки
+        current_profile_path = getattr(driver, "profile_path", None)
 
         # Загрузка cookies для авторизации и поиска
         if use_business_auth and not STOP_PARSING:
@@ -971,6 +954,10 @@ def get_prices(product_name: str, headless: bool = True, driver_path: Optional[s
             if success:
                 CREATED_PROFILES.discard(current_profile_path)
 
+def _make_product_cache_key(product_name: str) -> str:
+    """Ключ кэша для повторяющихся наименований товаров."""
+    return re.sub(r"\s+", " ", str(product_name or "")).strip().lower()
+
 def parse_tender_excel(input_file: str, output_file: str, headless: bool = True,
                       workers: int = 1, driver_path: Optional[str] = None,
                       auto_save: bool = True, use_business_auth: bool = False) -> pd.DataFrame:
@@ -999,26 +986,41 @@ def parse_tender_excel(input_file: str, output_file: str, headless: bool = True,
 
     CURRENT_DATAFRAME = df  # Для автосохранения
 
+    effective_workers = max(1, int(workers or 1))
+    if effective_workers != 1:
+        logger.warning("Параметр workers сейчас не используется: обработка выполняется последовательно")
+
     auth_text = "с авторизацией" if use_business_auth else "без авторизации"
     logger.info(f"Начинаю обработку {len(df)} товаров {auth_text}")
     logger.info("🔄 Автосохранение при принудительном завершении АКТИВНО")
     logger.info("📋 РЕЗУЛЬТАТ: тендерная таблица с колонкой 'Яндекс Маркет'")
     logger.info("Режим: поиск наименьшей цены среди 5 карточек")
 
+    cache: Dict[str, Dict[str, str]] = {}
+
     try:
-        for idx, row in df.iterrows():
+        for idx, row in enumerate(df.itertuples(index=False), start=1):
             if STOP_PARSING:
                 logger.info("Парсинг остановлен")
                 break
 
             try:
-                logger.info(f"Обработка: {idx + 1}/{len(df)} - {row['наименование'][:40]}...")
+                product_name = row.наименование
+                logger.info(f"Обработка: {idx}/{len(df)} - {product_name[:40]}...")
 
-                prices = get_prices(row['наименование'], headless, driver_path, 20, use_business_auth)
+                cache_key = _make_product_cache_key(product_name)
+                if cache_key in cache:
+                    prices = cache[cache_key]
+                    logger.info(f"Повтор товара, использую кэш: {product_name[:40]}...")
+                else:
+                    prices = get_prices(product_name, headless, driver_path, 20, use_business_auth)
+                    if any(prices.get(k) for k in ("цена", "цена для юрлиц", "ссылка")):
+                        cache[cache_key] = prices.copy()
 
-                df.at[idx, 'цена'] = prices.get('цена', '')
-                df.at[idx, 'цена для юрлиц'] = prices.get('цена для юрлиц', '')
-                df.at[idx, 'ссылка'] = prices.get('ссылка', '')
+                row_idx = idx - 1
+                df.at[row_idx, 'цена'] = prices.get('цена', '')
+                df.at[row_idx, 'цена для юрлиц'] = prices.get('цена для юрлиц', '')
+                df.at[row_idx, 'ссылка'] = prices.get('ссылка', '')
 
                 # Лог результата
                 price_summary = []
@@ -1028,22 +1030,22 @@ def parse_tender_excel(input_file: str, output_file: str, headless: bool = True,
                     price_summary.append(f"Для юрлиц: {prices['цена для юрлиц'][:15]}")
 
                 if price_summary:
-                    logger.info(f"Результат {idx + 1}/{len(df)}: {', '.join(price_summary)}")
+                    logger.info(f"Результат {idx}/{len(df)}: {', '.join(price_summary)}")
                 else:
-                    logger.info(f"Результат {idx + 1}/{len(df)}: цены не найдены")
+                    logger.info(f"Результат {idx}/{len(df)}: цены не найдены")
 
                 # Автосохранение каждые 3 товара В ТЕНДЕРНОМ ФОРМАТЕ
-                if auto_save and (idx + 1) % 3 == 0:
+                if auto_save and idx % 3 == 0:
                     try:
                         save_results_into_tender_format(input_file, output_file, df)
-                        logger.info(f"Автосохранение тендера: {idx + 1}/{len(df)}")
+                        logger.info(f"Автосохранение тендера: {idx}/{len(df)}")
                     except Exception as e:
                         logger.warning(f"Ошибка автосохранения: {e}")
 
             except Exception as e:
-                logger.error(f"Ошибка товара {idx + 1}: {e}")
-                df.at[idx, 'цена'] = "ОШИБКА"
-                df.at[idx, 'цена для юрлиц'] = "ОШИБКА"
+                logger.error(f"Ошибка товара {idx}: {e}")
+                df.at[idx - 1, 'цена'] = "ОШИБКА"
+                df.at[idx - 1, 'цена для юрлиц'] = "ОШИБКА"
 
     finally:
         cleanup_profiles()
