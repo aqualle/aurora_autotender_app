@@ -166,7 +166,7 @@ class ParserGUI:
                 if mode in ["yandex", "both"]:
                     self.log_msg("  🔍 Яндекс Маркет...")
                     try:
-                        result = get_prices_yandex(name, headless, 20, True)
+                        result = get_prices_yandex(name, headless=headless, timeout=20, use_business_auth=True)
                         self.yandex_results[i] = {
                             "цена": result.get("цена", ""),
                             "цена для юрлиц": result.get("цена для юрлиц", ""),
