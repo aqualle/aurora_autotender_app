@@ -291,33 +291,58 @@ def get_prices(product_name: str, headless: bool = True, driver_path: Optional[s
             
             logger.info(f"✅ Найдено товаров: {len(product_links)}")
             
-            # Собираем URL
-            unique_urls = []
+            # Собираем и ранжируем кандидатов по релевантности
+            candidates = []
             seen = set()
-            for link in product_links[:10]:
+            for link in product_links[:40]:
                 try:
                     url = link.get_attribute('href')
-                    if url and '/product/' in url and url not in seen:
-                        unique_urls.append(url)
-                        seen.add(url)
-                        if len(unique_urls) >= 5:
-                            break
-                except:
+                    if not url or '/product/' not in url:
+                        continue
+                    normalized_url = url.split('?')[0]
+                    if normalized_url in seen:
+                        continue
+
+                    title = (link.text or '').strip()
+                    if not title:
+                        title = (link.get_attribute('title') or '').strip()
+                    if not title:
+                        title = (link.get_attribute('aria-label') or '').strip()
+
+                    score = _score_ozon_relevance(query, title)
+                    candidates.append({
+                        'url': normalized_url,
+                        'title': title,
+                        'score': score,
+                    })
+                    seen.add(normalized_url)
+                except Exception:
                     continue
-            
-            logger.info(f"✅ Найдено для проверки: {len(unique_urls)} товаров")
-            
-            if not unique_urls:
+
+            if not candidates:
+                logger.warning("❌ Не удалось сформировать список кандидатов")
+                return result
+
+            max_score = max((c['score'] for c in candidates), default=0)
+            if max_score > 0:
+                selected = [c for c in candidates if c['score'] == max_score][:5]
+                logger.info(f"✅ Релевантных кандидатов: {len(selected)} из {len(candidates)} (score={max_score})")
+            else:
+                selected = candidates[:5]
+                logger.info(f"✅ Релевантность не определена, проверяю первые {len(selected)} карточек")
+
+            if not selected:
                 return result
             
             # Проверяем товары
             all_prices = []
-            for i, url in enumerate(unique_urls, 1):
+            for i, candidate in enumerate(selected, 1):
+                url = candidate['url']
                 if STOP_PARSING:
                     break
                 
                 try:
-                    logger.debug(f"Товар {i}/{len(unique_urls)}: {url[:50]}...")
+                    logger.debug(f"Товар {i}/{len(selected)}: {url[:50]}...")
                     driver.get(url)
                     time.sleep(1.5)
                     

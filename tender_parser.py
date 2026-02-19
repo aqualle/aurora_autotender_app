@@ -600,6 +600,22 @@ def extract_products_smart(driver) -> List[Dict[str, Any]]:
 
     return products
 
+
+
+def _score_product_relevance(search_term: str, title: str) -> int:
+    """Простая оценка релевантности карточки по пересечению токенов."""
+    query_tokens = {
+        t for t in re.split(r"[^a-zA-Zа-яА-Я0-9]+", str(search_term).lower())
+        if len(t) >= 3
+    }
+    title_tokens = {
+        t for t in re.split(r"[^a-zA-Zа-яА-Я0-9]+", str(title).lower())
+        if len(t) >= 3
+    }
+    if not query_tokens or not title_tokens:
+        return 0
+    return len(query_tokens & title_tokens)
+
 def parse_price_to_number(price_str: str) -> float:
     """Конвертирует строку цены в число для сравнения"""
     if not price_str:
@@ -628,13 +644,28 @@ def collect_prices_from_all_products(driver, products: List[Dict[str, Any]], sea
         logger.warning("Нет товаров для обработки")
         return result
 
+    scored_products = []
+    for product in products:
+        score = _score_product_relevance(search_term, product.get('title', ''))
+        product_copy = dict(product)
+        product_copy['relevance_score'] = score
+        scored_products.append(product_copy)
+
+    max_score = max((p['relevance_score'] for p in scored_products), default=0)
+    if max_score > 0:
+        filtered_products = [p for p in scored_products if p['relevance_score'] == max_score]
+        logger.info(f"Отобрано релевантных карточек: {len(filtered_products)} из {len(products)} (score={max_score})")
+    else:
+        filtered_products = scored_products
+        logger.info("Релевантные токены не найдены, проверяю исходные карточки")
+
     # Контейнеры для всех найденных цен
     all_products_data = []
 
-    logger.info(f"Собираю цены с {len(products)} карточек товаров:")
+    logger.info(f"Собираю цены с {len(filtered_products)} карточек товаров:")
 
-    # Проходим по ВСЕМ товарам и собираем цены
-    for i, product in enumerate(products, 1):
+    # Проходим по отфильтрованным товарам и собираем цены
+    for i, product in enumerate(filtered_products, 1):
         if STOP_PARSING:
             break
 
@@ -906,6 +937,13 @@ def get_prices(product_name: str, headless: bool = True, driver_path: Optional[s
     result = {"цена": "", "цена для юрлиц": "", "ссылка": ""}
     driver = None
     current_profile_path = None
+
+    # Совместимость со старым позиционным вызовом: get_prices(name, headless, timeout, use_business_auth)
+    if isinstance(driver_path, (int, float)):
+        if timeout == 15:
+            timeout = int(driver_path)
+        logger.warning("Обнаружен старый позиционный вызов get_prices(..., timeout, ...). Обновите вызов на именованные аргументы")
+        driver_path = None
 
     if STOP_PARSING:
         return result
