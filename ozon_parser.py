@@ -40,22 +40,6 @@ def _go_to_ozon_search(driver, query: str) -> bool:
         logger.warning(f"Не удалось перейти на страницу поиска Ozon напрямую: {e}")
         return False
 
-
-
-def _score_ozon_relevance(search_term: str, title: str) -> int:
-    query_tokens = {
-        t for t in re.split(r"[^a-zA-Zа-яА-Я0-9]+", str(search_term).lower())
-        if len(t) >= 3
-    }
-    title_tokens = {
-        t for t in re.split(r"[^a-zA-Zа-яА-Я0-9]+", str(title).lower())
-        if len(t) >= 3
-    }
-    if not query_tokens or not title_tokens:
-        return 0
-    return len(query_tokens & title_tokens)
-
-
 def create_ozon_edge_driver(headless: bool = False):
     paths = get_browser_paths()["edge"]
 
